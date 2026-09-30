@@ -4,8 +4,9 @@
 --   lua tests/test_dataflow.lua
 --
 -- Only pure functions are covered (stmt_summary, clip_statement,
--- http_span_name); the span handle and delivery paths need a live process
--- and a reachable server, so they stay out of this runner.
+-- http_span_name, scan_extract, scan_json); the span handle, delivery and
+-- directory-walking paths need a live process and a reachable server, so
+-- they stay out of this runner.
 
 -- Locate the module relative to this script so `lua tests/test_dataflow.lua`
 -- works from any working directory.
@@ -70,6 +71,120 @@ eq(dataflow.http_span_name("PUT", "/local/path"), "PUT /local/path", "relative p
 eq(dataflow.http_span_name("GET", "localhost:6379"), "GET localhost:6379", "scheme-less host:port")
 eq(dataflow.http_span_name("GET", ""), "GET", "empty url")
 eq(dataflow.http_span_name(nil, nil), "", "nil method and url")
+
+-- ---------------------------------------------------------------------------
+-- scan_extract: static route extraction (lua-resty-route, dispatch tables,
+-- ngx.var.uri guards)
+
+local function routes_repr(routes)
+  local out = {}
+  for i, r in ipairs(routes) do
+    out[i] = r.method .. " " .. r.path .. " -> " .. r.handler
+  end
+  return table.concat(out, "; ")
+end
+
+-- lua-resty-route, flat r:verb calls
+local flat = dataflow.scan_extract("app/routes.lua", [==[
+local r = require("resty.route").new()
+r:get("/api/orders/:id", orders.show)
+r:post("/api/orders", orders.create)
+r:put("/api/orders/:id", orders.update)
+r:delete("/api/orders/:id", orders.destroy)
+r:patch("/api/orders/:id", orders.patch)
+]==])
+eq(#flat, 5, "route flat: count")
+eq(routes_repr(flat),
+  "GET /api/orders/:id -> orders.show; POST /api/orders -> orders.create; " ..
+  "PUT /api/orders/:id -> orders.update; DELETE /api/orders/:id -> orders.destroy; " ..
+  "PATCH /api/orders/:id -> orders.patch",
+  "route flat: methods, paths, handlers")
+eq(flat[1].source_file, "app/routes.lua", "route flat: source_file passthrough")
+
+-- route("/base", function(r) ... end): one level of prefix
+local nested = dataflow.scan_extract("app/api.lua", [==[
+route("/api", function(r)
+  r:get("/users", users.list)
+  r:post("/users", users.create)
+end)
+r:get("/health", health.check)
+]==])
+eq(routes_repr(nested),
+  "GET /api/users -> users.list; POST /api/users -> users.create; GET /health -> health.check",
+  "route nested: one-level prefix, restored after end)")
+
+-- dispatch tables (verb-keyed bracket assignments)
+local dispatch = dataflow.scan_extract("app/handlers.lua", [==[
+local routes = {
+  get = {
+    ["/items"] = items.list,
+    ["/items/:id"] = items.show,
+  },
+  post = {
+    ["/items"] = items.create,
+  },
+}
+]==])
+eq(routes_repr(dispatch),
+  "GET /items -> items.list; GET /items/:id -> items.show; POST /items -> items.create",
+  "dispatch table: multi-line verb blocks")
+
+-- single-line dispatch table
+local inline = dataflow.scan_extract("app/inline.lua", [==[
+local t = { get = { ["/ping"] = ping.handler } }
+]==])
+eq(routes_repr(inline), "GET /ping -> ping.handler", "dispatch table: single line")
+
+-- ngx.var.uri guards -> GET with an empty handler, deduplicated
+local guard = dataflow.scan_extract("app/status.lua", [==[
+if ngx.var.uri == "/status" then
+  ngx.say("ok")
+end
+if ngx.var.uri == "/status" then
+  ngx.say("again")
+end
+]==])
+eq(routes_repr(guard), "GET /status -> ", "ngx.var.uri guard: GET, empty handler, dedup")
+
+-- handler forms: quoted, anonymous function, table arg; commented-out
+-- routes ignored; non-path first args (e.g. redis) ignored
+local forms = dataflow.scan_extract("app/forms.lua", [==[
+r:get("/a", "orders.show")
+r:get("/b", function(r) ngx.say("hi") end)
+r:get("/c", { id = true })
+-- r:get("/gone", orders.gone)
+red:get("session:" .. sid)
+]==])
+eq(routes_repr(forms), "GET /a -> orders.show; GET /b -> ; GET /c -> ",
+  "handler forms + comment + non-path call ignored")
+eq(#dataflow.scan_extract("x.lua", nil), 0, "scan_extract: nil source -> empty, no raise")
+
+-- {id} path params kept as written; path must start with "/"
+local braces = dataflow.scan_extract("app/braces.lua", [==[
+r:get("/users/{id}/orders", orders.by_user)
+r:get("relative", nope.handler)
+]==])
+eq(routes_repr(braces), "GET /users/{id}/orders -> orders.by_user",
+  "brace params kept, non-slash path skipped")
+
+-- ---------------------------------------------------------------------------
+-- scan_json: catalog body
+
+local body = dataflow.scan_json({
+  service_name = 'serv"ice',
+  routes = {
+    { method = "GET", path = "/api/orders/:id", handler = "orders.show", source_file = "app/routes.lua" },
+    { method = "POST", path = "/x", handler = "", source_file = "b.lua" },
+  },
+})
+eq(body,
+  '{"service_name":"serv\\"ice","routes":[' ..
+  '{"method":"GET","path":"/api/orders/:id","handler":"orders.show","source_file":"app/routes.lua"},' ..
+  '{"method":"POST","path":"/x","handler":"","source_file":"b.lua"}]}',
+  "scan_json: stable order, escaping")
+eq(dataflow.scan_json(nil), '{"service_name":"","routes":[]}', "scan_json: nil catalog -> empty body")
+eq(dataflow.scan_json({ service_name = "s" }), '{"service_name":"s","routes":[]}',
+  "scan_json: no routes -> empty array")
 
 print(string.format("dataflow transport tests: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end

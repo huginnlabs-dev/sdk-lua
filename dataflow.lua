@@ -16,15 +16,21 @@
 --   http:finish()  -- transport spans must be finished explicitly
 --   dataflow.flush()
 --
+-- Static route scanning (see also scan_cli.lua): dataflow.scan(dir, opts)
+-- extracts declared HTTP endpoints from Lua sources (lua-resty-route calls,
+-- dispatch tables, ngx.var.uri guards) and dataflow.scan_post(catalog)
+-- ships them to POST /api/v1/catalog.
+--
 -- Env: DATAFLOW_ENDPOINT (http://host:port), DATAFLOW_API_KEY,
 -- DATAFLOW_SERVICE_NAME, DATAFLOW_SAMPLE_RATIO, DATAFLOW_BUFFER_SIZE,
--- DATAFLOW_HTTP_URL (HTTP base for the startup manifest), DATAFLOW_APP_VERSION.
+-- DATAFLOW_HTTP_URL (HTTP base for the startup manifest and the route
+-- catalog post), DATAFLOW_APP_VERSION.
 --
 -- Payload VALUES ship as plaintext JSON in v0.1 (a warning is printed
 -- once); field NAMES also travel in `data.fields` metadata for lineage, so
 -- adding client-side encryption later stays transparent to the dashboard.
 
-local M = { _VERSION = "0.3.0" }
+local M = { _VERSION = "0.4.0" }
 
 -- ---------------------------------------------------------------------------
 -- settings
@@ -167,6 +173,365 @@ send_manifest = function()
     local f = io.popen(cmd, "r")
     if f then f:close() end
   end)
+end
+
+-- ---------------------------------------------------------------------------
+-- static route scanning (dataflow.scan; pattern-based, pure Lua — no lpeg,
+-- no luasocket). Recognized OpenResty idioms, all best-effort:
+--   r:get("/path", handler)          lua-resty-route (post/put/delete/patch too)
+--   route("/base", function(r) ... end)  ONE level of prefix, do-end tracked
+--   get = { ["/path"] = handler }    dispatch tables (best effort)
+--   if ngx.var.uri == "/path" then   heuristic -> GET with an empty handler
+-- A route needs a string-literal path starting with "/"; commented-out code
+-- is ignored; path params keep their written form (":id" or "{id}").
+
+local SCAN_VERBS = { get = true, post = true, put = true, delete = true, patch = true }
+local SCAN_SKIP_DIRS = { [".git"] = true, ["deps"] = true, ["t"] = true }
+local SCAN_MAX_ROUTES = 1000
+
+local SCAN_ROUTE_CALL_PAT = '([%a_][%w_]*)%s*:%s*(%a+)%s*%(%s*"(/[^"]*)"%s*,%s*([^)]*)%)'
+local SCAN_BRACKET_PAT = '%[%s*["\'](/[^"\']*)["\']%s*%]%s*=%s*([^,}]+)'
+local SCAN_INLINE_DISPATCH_PAT = '([%a_][%w_]*)%s*=%s*{%s*%[%s*["\'](/[^"\']*)["\']%s*%]%s*=%s*([^,}]+)'
+local SCAN_GUARD_PAT = 'ngx%.var%.uri%s*==%s*["\'](/[^"\']*)["\']'
+local SCAN_ROUTE_OPEN_PAT = 'route%s*%(%s*["\'](/[^"\']*)["\']%s*,%s*function%f[%W]'
+local SCAN_DISPATCH_OPEN_PAT = "^%s*([%a_][%w_]*)%s*=%s*{%s*$"
+
+local function scan_trim(s)
+  return (tostring(s or ""):match("^%s*(.-)%s*$"))
+end
+
+-- handler call argument -> identifier string ("" for anonymous functions,
+-- tables and anything else we cannot name conservatively).
+local function scan_handler_name(arg)
+  arg = scan_trim(arg)
+  if arg == "" or arg:match("^function%f[%W]") or arg == "function" then return "" end
+  local quoted = arg:match('^"([^"]*)"') or arg:match("^'([^']*)'")
+  if quoted then return quoted end
+  return arg:match("^[%w_.]+") or ""
+end
+
+local function scan_join_prefix(prefix, path)
+  if not prefix or prefix == "" or prefix == "/" then return path end
+  if path == "/" then return prefix end
+  return prefix .. path
+end
+
+-- Pure: best-effort comment stripping. Block comments are removed with a
+-- two-state pass (an unterminated /*-style "--[[" swallows lines until "]]");
+-- line comments respect string literals so paths containing "--" survive.
+local function scan_strip_block_comments(line, state)
+  while true do
+    if state.in_block then
+      local close = line:find("]]", 1, true)
+      if not close then return "", true end
+      line = line:sub(close + 2)
+      state.in_block = false
+    end
+    local open = line:find("--[[", 1, true)
+    if not open then return line end
+    local close = line:find("]]", open + 4, true)
+    if not close then
+      state.in_block = true
+      return line:sub(1, open - 1)
+    end
+    line = line:sub(1, open - 1) .. " " .. line:sub(close + 2)
+  end
+end
+
+local function scan_strip_line_comment(line)
+  local in_str, i, n = nil, 1, #line
+  while i <= n do
+    local c = line:sub(i, i)
+    if in_str then
+      if c == "\\" then i = i + 1
+      elseif c == in_str then in_str = nil end
+    elseif c == '"' or c == "'" then
+      in_str = c
+    elseif c == "-" and line:sub(i + 1, i + 1) == "-" then
+      return line:sub(1, i - 1)
+    end
+    i = i + 1
+  end
+  return line
+end
+
+local function scan_count_keyword(line, word)
+  local n = 0
+  for _ in line:gmatch("%f[%w_]" .. word .. "%f[%W]") do n = n + 1 end
+  return n
+end
+
+local function scan_brace_delta(line)
+  local _, open = line:gsub("{", "")
+  local _, close = line:gsub("}", "")
+  return open - close
+end
+
+-- Pure: extract routes from one source string. Returns a list of
+-- { method, path, handler, source_file } in source order; duplicates
+-- collapse (first handler wins, unless the first sighting had none).
+local function scan_extract_source(filename, source)
+  local routes, seen = {}, {}
+  local prefix, nest = nil, 0      -- route("/base", function(r) ... end)
+  local dispatch, depth = nil, 0   -- verb = { ["/path"] = handler } tables
+  local state = { in_block = false }
+
+  local function emit(verb, path, handler)
+    verb = string.upper(tostring(verb))
+    path = scan_trim(path)
+    if path == "" or path:sub(1, 1) ~= "/" then return end
+    local key = verb .. " " .. path
+    local at = seen[key]
+    if at then
+      if routes[at].handler == "" and (handler or "") ~= "" then
+        routes[at].handler = handler
+      end
+      return
+    end
+    seen[key] = #routes + 1
+    routes[#routes + 1] = { method = verb, path = path,
+      handler = handler or "", source_file = filename }
+  end
+
+  for line in (source .. "\n"):gmatch("(.-)\n") do
+    line = scan_strip_block_comments(line, state)
+    line = scan_strip_line_comment(line)
+
+    -- bracket entries of an open dispatch table: ["/path"] = handler
+    if dispatch then
+      for path, h in line:gmatch(SCAN_BRACKET_PAT) do
+        emit(dispatch.verb, path, scan_handler_name(h))
+      end
+    end
+
+    -- single-line dispatch tables: { get = { ["/path"] = handler } }
+    for verb, path, h in line:gmatch(SCAN_INLINE_DISPATCH_PAT) do
+      if SCAN_VERBS[string.lower(verb)] then
+        emit(verb, path, scan_handler_name(h))
+      end
+    end
+
+    -- receiver calls: r:get("/path", handler)
+    for _, verb, path, h in line:gmatch(SCAN_ROUTE_CALL_PAT) do
+      if SCAN_VERBS[string.lower(verb)] then
+        emit(verb, scan_join_prefix(prefix, path), scan_handler_name(h))
+      end
+    end
+
+    -- ngx.var.uri == "/path" guards (heuristic: GET, no handler)
+    for path in line:gmatch(SCAN_GUARD_PAT) do
+      emit("GET", path, "")
+    end
+
+    -- dispatch table bookkeeping (brace depth, best effort)
+    depth = depth + scan_brace_delta(line)
+    if dispatch and depth < dispatch.depth then dispatch = nil end
+    if not dispatch and depth > 0 then
+      local verb = line:match(SCAN_DISPATCH_OPEN_PAT)
+      if verb and SCAN_VERBS[string.lower(verb)] then
+        dispatch = { verb = string.lower(verb), depth = depth }
+      end
+    end
+
+    -- route() prefix bookkeeping: one level, do-end tracked
+    local rs, re, rbase = line:find(SCAN_ROUTE_OPEN_PAT)
+    if rs then
+      if not prefix then
+        prefix = rbase
+        local rest = line:sub(re + 1)
+        nest = 1 + scan_count_keyword(rest, "do") + scan_count_keyword(rest, "function")
+        nest = nest - scan_count_keyword(rest, "end")
+      else
+        nest = nest + scan_count_keyword(line, "do")
+        nest = nest + scan_count_keyword(line, "function")
+        nest = nest - scan_count_keyword(line, "end")
+      end
+      if nest <= 0 then prefix = nil end
+    elseif prefix then
+      nest = nest + scan_count_keyword(line, "do")
+      nest = nest + scan_count_keyword(line, "function")
+      nest = nest - scan_count_keyword(line, "end")
+      if nest <= 0 then prefix = nil end
+    end
+  end
+
+  return routes
+end
+
+--- Pure: extract declared routes from one Lua source string. Never raises.
+--- Returns a list of { method, path, handler, source_file } tables.
+function M.scan_extract(filename, source)
+  local ok, routes = pcall(scan_extract_source, tostring(filename or ""), tostring(source or ""))
+  if not ok then return {} end
+  return routes
+end
+
+-- Pure: stable-order JSON body for POST /api/v1/catalog (<= 1000 routes,
+-- mirroring the server-side cap).
+function M.scan_json(catalog)
+  local ok, body = pcall(function()
+    local parts = {}
+    for i, r in ipairs((type(catalog) == "table" and catalog or {}).routes or {}) do
+      if i > SCAN_MAX_ROUTES then break end
+      parts[#parts + 1] = "{" ..
+          '"method":' .. json_escape(r.method) .. "," ..
+          '"path":' .. json_escape(r.path) .. "," ..
+          '"handler":' .. json_escape(r.handler) .. "," ..
+          '"source_file":' .. json_escape(r.source_file) .. "}"
+    end
+    local service = type(catalog) == "table" and catalog.service_name or ""
+    return "{" ..
+        '"service_name":' .. json_escape(service) .. "," ..
+        '"routes":[' .. table.concat(parts, ",") .. "]}"
+  end)
+  if not ok then return '{"service_name":"","routes":[]}' end
+  return body
+end
+
+local function scan_dir_exists(dir)
+  local f = io.open(dir, "r")
+  if not f then return false end
+  f:close()
+  return true
+end
+
+local function scan_sh_quote(s)
+  return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
+-- File listing via io.popen (same external-tool approach as curl): `find`
+-- on POSIX, `dir /s /b` on Windows; nil when the pipe cannot be opened.
+local function scan_list_files(dir)
+  local sep = package.config:sub(1, 1)
+  local cmd
+  if sep == "\\" then
+    cmd = string.format('dir /s /b "%s\\*.lua" 2>nul', (tostring(dir):gsub('"', "")))
+  else
+    cmd = string.format("find %s -type f -name '*.lua' 2>/dev/null", scan_sh_quote(dir))
+  end
+  local f = io.popen(cmd, "r")
+  if not f then return nil end
+  local out = f:read("*a") or ""
+  f:close()
+  local files = {}
+  for path in out:gmatch("[^\r\n]+") do
+    path = scan_trim(path)
+    if path ~= "" then files[#files + 1] = path end
+  end
+  return files
+end
+
+local function scan_rel_path(dir, path)
+  local norm = (path:gsub("\\", "/"))
+  local base = (tostring(dir):gsub("\\", "/"))
+  base = base:gsub("/+$", "")
+  if base ~= "" and norm:sub(1, #base + 1) == base .. "/" then
+    norm = norm:sub(#base + 2)
+  end
+  return (norm:gsub("^%./", ""))
+end
+
+local function scan_skipped(rel, extra)
+  for comp in rel:gmatch("[^/]+") do
+    if SCAN_SKIP_DIRS[comp] then return true end
+    if extra and extra[comp] then return true end
+  end
+  return false
+end
+
+local function scan_dir_basename(dir)
+  local base = (tostring(dir):gsub("\\", "/")):gsub("/+$", "")
+  return base:match("[^/]+$") or base
+end
+
+local function scan_dir(dir, opts)
+  opts = opts or {}
+  dir = tostring(dir or "")
+  if dir == "" then return nil, "scan: no directory given" end
+  if not scan_dir_exists(dir) then return nil, "scan: cannot open directory: " .. dir end
+  local files = scan_list_files(dir)
+  if not files then return nil, "scan: could not list directory: " .. dir end
+
+  local exclude = {}
+  for _, name in ipairs(opts.exclude or {}) do exclude[tostring(name)] = true end
+
+  local routes = {}
+  for _, path in ipairs(files) do
+    local rel = scan_rel_path(dir, path)
+    if not scan_skipped(rel, exclude) then
+      local f = io.open(path, "r")
+      if f then
+        local source = f:read("*a") or ""
+        f:close()
+        for _, r in ipairs(M.scan_extract(rel, source)) do
+          if #routes >= SCAN_MAX_ROUTES then break end
+          routes[#routes + 1] = r
+        end
+      end
+    end
+    if #routes >= SCAN_MAX_ROUTES then break end
+  end
+
+  table.sort(routes, function(a, b)
+    if a.source_file ~= b.source_file then return a.source_file < b.source_file end
+    if a.method ~= b.method then return a.method < b.method end
+    return a.path < b.path
+  end)
+
+  local service = opts.service_name
+  if service == nil or service == "" then service = env("DATAFLOW_SERVICE_NAME", "") end
+  if service == "" then service = scan_dir_basename(dir) end
+  return { service_name = service, routes = routes }
+end
+
+--- Pure-ish: walk dir for *.lua (skipping .git/, deps/, t/ and opts.exclude
+--- entries), extract routes, sort by (source_file, method, path). Returns
+--- { service_name = ..., routes = {...} } or nil + reason; never raises.
+--- Service name: opts.service_name > DATAFLOW_SERVICE_NAME > dir basename.
+--- Directory listing uses io.popen (find / dir), like the curl transport.
+function M.scan(dir, opts)
+  local ok, res, err = pcall(scan_dir, dir, opts)
+  if not ok then return nil, tostring(res) end
+  if res == nil then return nil, err end
+  return res
+end
+
+-- Best-effort catalog post, mirroring the manifest: same curl mechanics,
+-- response ignored. Base URL: opts.url > DATAFLOW_HTTP_URL > URL-form
+-- DATAFLOW_ENDPOINT (bare host:port cannot be derived -> skip). API key:
+-- opts.api_key > configured key > DATAFLOW_API_KEY.
+local function scan_post_catalog(catalog, opts)
+  opts = opts or {}
+  if type(catalog) ~= "table" or scan_trim(tostring(catalog.service_name)) == "" then
+    return nil, "scan_post: catalog table with service_name required"
+  end
+  local base = opts.url
+  if base == nil or base == "" then base = http_base() end
+  if not base then
+    return nil, "scan_post: no HTTP base URL (set DATAFLOW_HTTP_URL or an http(s) DATAFLOW_ENDPOINT)"
+  end
+  local key = opts.api_key
+  if key == nil or key == "" then key = settings.api_key end
+  if key == nil or key == "" then key = env("DATAFLOW_API_KEY", "") end
+  if key == "" then
+    return nil, "scan_post: no API key (set DATAFLOW_API_KEY or pass opts.api_key)"
+  end
+  local body = M.scan_json(catalog)
+  local cmd = string.format(
+    'curl -s -m 10 -X POST -H "Content-Type: application/json" -H "X-Api-Key: %s" -d %s %s 2>/dev/null',
+    key, string.format("%q", body), base .. "/api/v1/catalog")
+  local f = io.popen(cmd, "r")
+  if f then f:close() end
+  return true, nil
+end
+
+--- Posts a scan() catalog to POST /api/v1/catalog (best-effort, like the
+--- startup manifest). Returns true, or nil + reason; never raises.
+function M.scan_post(catalog, opts)
+  local ok, res, err = pcall(scan_post_catalog, catalog, opts)
+  if not ok then return nil, tostring(res) end
+  if res == nil then return nil, err end
+  return true
 end
 
 -- ---------------------------------------------------------------------------

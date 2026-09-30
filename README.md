@@ -119,11 +119,74 @@ pure helpers you can also call directly:
 | `UPDATE public.items SET stock = $1` | `UPDATE items` |
 | `CREATE TABLE IF NOT EXISTS public.audit_log (id int)` | `CREATE audit_log` |
 
+## Route scanning (0.4.0)
+
+`dataflow.scan(dir, opts)` walks `*.lua` files under `dir` (skipping
+`.git/`, `deps/`, `t/` and `opts.exclude` entries), extracts declared HTTP
+endpoints with line-based pattern matching (pure Lua — no `lpeg`, no
+`luasocket`) and returns a catalog table for the server's route catalog:
+
+```lua
+local dataflow = require("dataflow")
+
+local catalog = dataflow.scan(".")
+-- catalog = { service_name = "...", routes = { { method = "GET",
+--   path = "/api/orders/:id", handler = "orders.show",
+--   source_file = "app/routes.lua" }, ... } }
+
+dataflow.scan_post(catalog) -- best-effort POST /api/v1/catalog
+```
+
+Recognized OpenResty idioms — all best-effort; a route needs a
+string-literal path starting with `/`, so client calls like
+`red:get("session:" .. sid)` never match:
+
+| source pattern | extracted |
+| --- | --- |
+| `r:get("/path", handler)` — `post`/`put`/`delete`/`patch` too (lua-resty-route) | `METHOD /path handler` |
+| `route("/base", function(r) r:get("/x", h) end)` | one level of prefix via do-end tracking → `GET /base/x` |
+| `get = { ["/path"] = handler }` dispatch tables | `GET /path handler` (brace-depth tracked, best effort) |
+| `if ngx.var.uri == "/path" then` | heuristic → `GET /path` with an empty handler |
+
+Path parameters keep their written form (`:id` or `{id}`). The handler is
+the identifier or string where visible (anonymous functions and table
+arguments yield `""`), and `source_file` is the path relative to the scan
+directory. Commented-out code is ignored; duplicates collapse by
+method + path (first handler wins, upgrading an empty one). `scan` sorts
+routes by `(source_file, method, path)` and caps at 1000 like the server.
+
+The pieces (all pcall-wrapped — nothing raises into the caller):
+
+- `dataflow.scan_extract(filename, source)` — pure; scan one source string,
+  returns the route list. Covered by `tests/test_dataflow.lua`.
+- `dataflow.scan_json(catalog)` — pure; stable-order JSON body
+  (`{"service_name":...,"routes":[{"method","path","handler","source_file"}]}`).
+- `dataflow.scan(dir, opts)` — walks the directory via `io.popen` (`find`
+  on POSIX, `dir /s /b` on Windows — the same external-tool approach as the
+  curl transport). Returns `nil, reason` for a bad directory.
+  `opts.service_name` overrides `DATAFLOW_SERVICE_NAME` / the directory
+  basename.
+- `dataflow.scan_post(catalog, opts)` — posts via `curl` exactly like the
+  manifest/ingest; returns `true` or `nil, reason`. Base URL:
+  `opts.url` > `DATAFLOW_HTTP_URL` > URL-form `DATAFLOW_ENDPOINT`; a bare
+  `host:port` endpoint without an HTTP override skips the post. API key:
+  `opts.api_key` > `DATAFLOW_API_KEY`.
+
+### CLI
+
+```
+lua scan_cli.lua --dir . [--service name] [--url base] [--api-key key] [--print]
+```
+
+`--print` prints the JSON body and skips the post. A missing URL or API key
+is a skip (message on stderr, exit code 0), not an error; a failing scan
+(bad directory) exits 1 and a usage error exits 2.
+
 ## Tests
 
 `lua tests/test_dataflow.lua` from the repository root — plain assert-based
 runner over the pure helpers only (statement summary, clipping, URL-to-span
-naming).
+naming, route extraction, catalog JSON).
 
 ## Versioning
 
