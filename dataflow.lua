@@ -13,13 +13,14 @@
 --   dataflow.flush()
 --
 -- Env: DATAFLOW_ENDPOINT (http://host:port), DATAFLOW_API_KEY,
--- DATAFLOW_SERVICE_NAME, DATAFLOW_SAMPLE_RATIO, DATAFLOW_BUFFER_SIZE.
+-- DATAFLOW_SERVICE_NAME, DATAFLOW_SAMPLE_RATIO, DATAFLOW_BUFFER_SIZE,
+-- DATAFLOW_HTTP_URL (HTTP base for the startup manifest), DATAFLOW_APP_VERSION.
 --
 -- Payload VALUES ship as plaintext JSON in v0.1 (a warning is printed
 -- once); field NAMES also travel in `data.fields` metadata for lineage, so
 -- adding client-side encryption later stays transparent to the dashboard.
 
-local M = { _VERSION = "0.1.0" }
+local M = { _VERSION = "0.2.0" }
 
 -- ---------------------------------------------------------------------------
 -- settings
@@ -27,6 +28,8 @@ local M = { _VERSION = "0.1.0" }
 local settings = { endpoint = "", api_key = "", service_name = "", sample_ratio = 1.0, buffer_size = 10000, disabled = false }
 local warned_plaintext = false
 local seq = 0
+local manifest_sent = false
+local send_manifest -- defined below; fires once from configure()
 
 local function env(k, fallback)
   local v = os.getenv(k)
@@ -42,6 +45,7 @@ function M.configure()
   settings.buffer_size = tonumber(env("DATAFLOW_BUFFER_SIZE", "10000")) or 10000
   settings.disabled = env("DATAFLOW_DISABLED", "false") == "true"
   math.randomseed(os.time() + seq)
+  send_manifest()
 end
 
 local function enabled()
@@ -73,6 +77,92 @@ local function json_escape(s)
     return map[c] or string.format("\\u%04x", c:byte())
   end)
   return '"' .. s .. '"'
+end
+
+-- ---------------------------------------------------------------------------
+-- service manifest (one best-effort POST at startup; mirrors the Go SDK)
+
+-- Pure: derives the /api/v1/manifest body from the runtime. OpenResty is
+-- detected via the ngx global; every introspection step is pcall-wrapped so
+-- exotic sandboxes degrade to empty strings instead of breaking startup.
+local function build_manifest(service, sdk_version)
+  local runtime_version = _VERSION or "Lua"
+  local framework = ""
+  local os_arch = ""
+  pcall(function()
+    if ngx == nil then return end
+    framework = "openresty"
+    runtime_version = runtime_version ..
+        " / openresty " .. tostring((ngx.config or {}).nginx_version or "")
+  end)
+  pcall(function()
+    os_arch = tostring((ngx.config or {}).ngx_architecture or "")
+  end)
+  return {
+    service_name = service,
+    language = "lua",
+    sdk_version = sdk_version,
+    runtime_version = runtime_version,
+    framework = framework,
+    os_arch = os_arch,
+    app_version = os.getenv("DATAFLOW_APP_VERSION") or "",
+    dependencies = {}, -- Lua has no introspectable dependency inventory
+  }
+end
+
+-- HTTP base for manifest reporting: DATAFLOW_HTTP_URL wins (needed when
+-- DATAFLOW_ENDPOINT is a bare host:port); an http(s) endpoint maps directly;
+-- otherwise there is no derivable base and reporting is skipped.
+local function http_base()
+  local via_env = env("DATAFLOW_HTTP_URL", "")
+  if via_env ~= "" then
+    via_env = (via_env:match("^%s*(.-)%s*$"):gsub("/+$", ""))
+    if via_env ~= "" then return via_env end
+  end
+  if settings.endpoint:find("^https?://") then
+    return (settings.endpoint:gsub("/+$", ""))
+  end
+  return nil
+end
+
+-- Field order is stable and matches the server contract.
+local function manifest_json(m)
+  local deps = {}
+  for _, d in ipairs(m.dependencies or {}) do
+    if type(d) == "table" then
+      deps[#deps + 1] = '{"name":' .. json_escape(d.name) ..
+          ',"version":' .. json_escape(d.version) .. "}"
+    else
+      deps[#deps + 1] = json_escape(d)
+    end
+  end
+  return "{" ..
+      '"service_name":' .. json_escape(m.service_name) .. "," ..
+      '"language":' .. json_escape(m.language) .. "," ..
+      '"sdk_version":' .. json_escape(m.sdk_version) .. "," ..
+      '"runtime_version":' .. json_escape(m.runtime_version) .. "," ..
+      '"framework":' .. json_escape(m.framework) .. "," ..
+      '"os_arch":' .. json_escape(m.os_arch) .. "," ..
+      '"app_version":' .. json_escape(m.app_version) .. "," ..
+      '"dependencies":[' .. table.concat(deps, ",") .. "]}"
+end
+
+-- Once per process, best-effort: same curl style as the ingest flush, any
+-- failure silent, tracing never depends on the manifest reaching the server.
+send_manifest = function()
+  if manifest_sent then return end
+  manifest_sent = true
+  pcall(function()
+    if settings.disabled or settings.api_key == "" then return end
+    local base = http_base()
+    if not base then return end
+    local body = manifest_json(build_manifest(service_name(), M._VERSION))
+    local cmd = string.format(
+      'curl -s -m 10 -X POST -H "Content-Type: application/json" -H "X-Api-Key: %s" -d %s %s 2>/dev/null',
+      settings.api_key, string.format("%q", body), base .. "/api/v1/manifest")
+    local f = io.popen(cmd, "r")
+    if f then f:close() end
+  end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -190,7 +280,7 @@ function Span:end_()
   if #keys > 0 then
     if not warned_plaintext then
       warned_plaintext = true
-      print("dataflow: warning: lua-sdk v0.1 ships payloads as plaintext")
+      print("dataflow: warning: lua-sdk v" .. M._VERSION .. " ships payloads as plaintext")
     end
     local parts = {}
     for _, k in ipairs(keys) do
