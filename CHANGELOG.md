@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 — 2026-09-30
+
+### Added
+- Crash capture: `dataflow.capture(fn, ...)` runs `fn` under `xpcall` with a `debug.traceback` message handler and records any error on the current span (a synthetic `exception` span, ended immediately, when none is open): status `500`, `error_message` clipped to 500 bytes, metadata `error.stack` = the traceback clipped to 8192 bytes — then returns `false, err` (the caller decides; nothing is re-raised). `dataflow.capture_or_raise(fn, ...)` records the same and re-raises with `error(err, 2)`. Recording is pcall-wrapped best-effort and never masks the original error; an unconfigured/disabled SDK degrades to a plain `xpcall` passthrough; success forwards `true` + all of `fn`'s results (pack/unpack keeps Lua 5.1 `xpcall` compatibility).
+- Pure `dataflow.clip_text(s, n)` byte cap (first `n` bytes, nil-safe), now also backing `clip_statement`'s 200-char clip.
+- `tests/test_dataflow.lua` covers `clip_text` and the capture paths (synthetic vs. current-span recording, `status_code`/`error_message`/`error.stack` fields, success and disabled passthrough) via a test-only `dataflow._test_buffer` hook; run manually — no Lua toolchain in CI.
+
 ## 0.4.0 — 2026-09-30
 
 ### Added

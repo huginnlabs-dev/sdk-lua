@@ -182,11 +182,62 @@ lua scan_cli.lua --dir . [--service name] [--url base] [--api-key key] [--print]
 is a skip (message on stderr, exit code 0), not an error; a failing scan
 (bad directory) exits 1 and a usage error exits 2.
 
+## Crash capture (0.5.0)
+
+`dataflow.capture(fn, ...)` runs `fn` under `xpcall` with a `debug.traceback`
+message handler and records any error before handing it back to the caller:
+
+- on the current span — an `HTTP_SERVER` span opened with `start_server_span`
+  in an OpenResty access/content phase, or the open `trace` span — status
+  `500`, `error_message` clipped to 500 bytes and metadata `error.stack` =
+  the traceback clipped to 8192 bytes (from the top);
+- on a synthetic `exception` span (ended immediately so the event ships)
+  when no span is open;
+- then **returns `false, err`** — the original error object is handed back,
+  never re-raised: the caller decides what to do (render an error page, log,
+  re-raise). `dataflow.capture_or_raise(fn, ...)` records the same way and
+  then raises `error(err, 2)` at the call site for handlers that must let
+  the crash propagate.
+
+Recording is best-effort (pcall-wrapped, never masks the original error) and
+degrades to a plain `xpcall` passthrough when the SDK is unconfigured or
+`DATAFLOW_DISABLED=true`. On success `capture` forwards `true` plus all of
+`fn`'s results.
+
+```lua
+local dataflow = require("dataflow")
+
+-- OpenResty content phase: capture decides the response, nothing re-raised
+local function content()
+  local span = dataflow.start_server_span(ngx.var.uri,
+    ngx.var.http_x_dataflow_trace_id)
+  local ok = dataflow.capture(render_page)
+  if not ok then
+    -- the span now carries status 500 + error_message + error.stack
+    ngx.status = 500
+    ngx.say("internal error")
+  elseif ngx.status >= 400 then
+    span:set_status(ngx.status)
+  end
+  span:end_()
+end
+
+-- access phase: the crash must propagate (OpenResty renders the error page)
+local ok, session = dataflow.capture_or_raise(verify_session)
+```
+
+`dataflow.clip_text(s, n)` is the pure byte cap behind the limits (first `n`
+bytes, nil-safe); `clip_statement` reuses it for the 200-char `db.statement`
+clip.
+
 ## Tests
 
 `lua tests/test_dataflow.lua` from the repository root — plain assert-based
-runner over the pure helpers only (statement summary, clipping, URL-to-span
-naming, route extraction, catalog JSON).
+runner over the pure helpers (statement summary, clipping, `clip_text`,
+URL-to-span naming, route extraction, catalog JSON) and the crash-capture
+paths, which run against a test-only buffer hook (`dataflow._test_buffer`)
+after a re-`configure()` with fake `DATAFLOW_*` values — still no server and
+no outbound curl (the startup manifest is sent once at require time).
 
 ## Versioning
 

@@ -21,6 +21,13 @@
 -- dispatch tables, ngx.var.uri guards) and dataflow.scan_post(catalog)
 -- ships them to POST /api/v1/catalog.
 --
+-- Crash capture: dataflow.capture(fn, ...) / dataflow.capture_or_raise(fn, ...)
+-- run a call under xpcall and record status 500, a clipped error_message and
+-- a clipped debug.traceback (metadata "error.stack") on the current span
+-- (a synthetic "exception" span when none is open) before the error
+-- propagates; capture() hands the error back (false, err), capture_or_raise()
+-- re-raises at the call site.
+--
 -- Env: DATAFLOW_ENDPOINT (http://host:port), DATAFLOW_API_KEY,
 -- DATAFLOW_SERVICE_NAME, DATAFLOW_SAMPLE_RATIO, DATAFLOW_BUFFER_SIZE,
 -- DATAFLOW_HTTP_URL (HTTP base for the startup manifest and the route
@@ -30,7 +37,7 @@
 -- once); field NAMES also travel in `data.fields` metadata for lineage, so
 -- adding client-side encryption later stays transparent to the dashboard.
 
-local M = { _VERSION = "0.4.0" }
+local M = { _VERSION = "0.5.0" }
 
 -- ---------------------------------------------------------------------------
 -- settings
@@ -858,8 +865,7 @@ end
 function M.clip_statement(sql)
   local s = tostring(sql or ""):gsub("%s+", " ")
   s = s:match("^%s*(.-)%s*$") or ""
-  if #s > 200 then s = s:sub(1, 200) end
-  return s
+  return M.clip_text(s, 200)
 end
 
 -- Transport span handle: wraps the standard span behind an explicit :finish()
@@ -942,6 +948,94 @@ function M.db_span(system, statement)
 end
 
 -- ---------------------------------------------------------------------------
+-- crash capture (dataflow.capture / dataflow.capture_or_raise)
+--
+-- Wire convention: on the CURRENT span — or a synthetic "exception" span
+-- when none is open — an error records status 500, error_message = the error
+-- clipped to ERROR_MESSAGE_MAX bytes and metadata "error.stack" =
+-- debug.traceback clipped to ERROR_STACK_MAX bytes from the top.
+-- capture() then RETURNS false, err (Lua idiom: the caller decides what to
+-- do — nothing is re-raised); capture_or_raise() re-raises at the call site
+-- instead.
+
+local ERROR_MESSAGE_MAX = 500
+local ERROR_STACK_MAX = 8192
+
+-- Pure: clip s to its first n bytes (nil-safe, non-strings coerced). Generic
+-- byte cap for error text; clip_statement (transport spans above) reuses it
+-- for the db.statement clip.
+function M.clip_text(s, n)
+  s = tostring(s or "")
+  n = tonumber(n) or 0
+  if n < 0 then n = 0 end
+  if #s > n then return s:sub(1, n) end
+  return s
+end
+
+-- pack/unpack keep the Lua 5.1 shape (its xpcall takes no extra arguments);
+-- table.unpack covers 5.2+.
+local function pack(...)
+  return { n = select("#", ...), ... }
+end
+
+local unpack = table.unpack or unpack
+
+-- Best-effort recording, pcall-wrapped: a broken span or a failing
+-- traceback must never mask the original error. Nothing is recorded when
+-- the SDK is unconfigured or disabled (plain xpcall passthrough).
+local function record_crash(err, stack)
+  if not enabled() then return end
+  pcall(function()
+    local span = current
+    local synthetic = false
+    if not span then
+      span = make_span("exception", "FUNCTION_CALL", nil)
+      synthetic = true
+    end
+    span:set_status(500)
+    span:record_error(M.clip_text(tostring(err), ERROR_MESSAGE_MAX))
+    span:attr("error.stack", M.clip_text(stack or "", ERROR_STACK_MAX))
+    if synthetic then span:end_() end
+  end)
+end
+
+--- Runs fn(...) under xpcall with a debug.traceback message handler. On
+--- error: records status 500 + error_message + "error.stack" metadata on
+--- the current span (a synthetic "exception" span, ended immediately, when
+--- none is open), then RETURNS false, err — the original error object is
+--- handed back and nothing is re-raised; the caller decides. On success
+--- returns true + all of fn's results. Unconfigured/disabled SDK degrades
+--- to a plain xpcall passthrough; the recording itself never masks the
+--- original error.
+function M.capture(fn, ...)
+  local args = pack(...)
+  local stack = {}
+  local out = pack(xpcall(function() return fn(unpack(args, 1, args.n)) end,
+    function(e)
+      -- pcall-wrapped including the debug table lookup: stripped sandboxes
+      -- degrade to an empty stack instead of masking the original error
+      local ok_tb, tb = pcall(function() return debug.traceback(tostring(e), 2) end)
+      stack[1] = ok_tb and tb or ""
+      return e
+    end))
+  if not out[1] then
+    record_crash(out[2], stack[1])
+    return false, out[2]
+  end
+  return unpack(out, 1, out.n)
+end
+
+--- Same recording as capture(), then error(err, 2): the crash propagates,
+--- attributed to the capture_or_raise call site. For handlers that must not
+--- swallow errors (e.g. OpenResty access/content phases that rely on the
+--- error page). Success forwards all of fn's results.
+function M.capture_or_raise(fn, ...)
+  local out = pack(M.capture(fn, ...))
+  if not out[1] then error(out[2], 2) end
+  return unpack(out, 2, out.n)
+end
+
+-- ---------------------------------------------------------------------------
 -- delivery (curl on PATH; fire-and-forget in v0.1)
 
 function M.flush()
@@ -954,6 +1048,14 @@ function M.flush()
   local f = io.popen(cmd, "r")
   if f then f:close() end
   buffer = {}
+end
+
+-- Test hook (tests/test_dataflow.lua): points the event buffer at `b` so
+-- pure tests can assert recorded events without a server or curl. Nil or a
+-- non-table resets to a fresh buffer. Not part of the public SDK surface.
+function M._test_buffer(b)
+  buffer = type(b) == "table" and b or {}
+  return buffer
 end
 
 M.configure()

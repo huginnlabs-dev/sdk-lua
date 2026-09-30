@@ -1,12 +1,16 @@
--- tests/test_dataflow.lua — pure-function tests for the transport helpers.
+-- tests/test_dataflow.lua — tests for the pure helpers and the crash-capture
+-- recording paths.
 --
 -- Run from the repository root:
 --   lua tests/test_dataflow.lua
 --
--- Only pure functions are covered (stmt_summary, clip_statement,
--- http_span_name, scan_extract, scan_json); the span handle, delivery and
--- directory-walking paths need a live process and a reachable server, so
--- they stay out of this runner.
+-- Pure helpers are covered directly (stmt_summary, clip_statement, clip_text,
+-- http_span_name, scan_extract, scan_json); the crash-capture paths run via
+-- the test-only buffer hook (dataflow._test_buffer) and a re-configure()
+-- with fake DATAFLOW_* values — no server, no outbound curl (the startup
+-- manifest is sent once at require time and later configure() calls skip
+-- it). The delivery and directory-walking paths need a live process and a
+-- reachable server, so they stay out of this runner.
 
 -- Locate the module relative to this script so `lua tests/test_dataflow.lua`
 -- works from any working directory.
@@ -185,6 +189,96 @@ eq(body,
 eq(dataflow.scan_json(nil), '{"service_name":"","routes":[]}', "scan_json: nil catalog -> empty body")
 eq(dataflow.scan_json({ service_name = "s" }), '{"service_name":"s","routes":[]}',
   "scan_json: no routes -> empty array")
+
+-- ---------------------------------------------------------------------------
+-- clip_text: generic byte cap (error_message 500 / error.stack 8192)
+
+eq(dataflow.clip_text("hello world", 5), "hello", "clip_text: clipped from the top")
+eq(dataflow.clip_text("hi", 5), "hi", "clip_text: short string intact")
+eq(dataflow.clip_text("hello", 0), "", "clip_text: zero cap -> empty")
+eq(dataflow.clip_text(nil, 5), "", "clip_text: nil -> empty")
+eq(dataflow.clip_text(12345, 3), "123", "clip_text: non-string coerced")
+eq(#dataflow.clip_text(string.rep("x", 9000), 8192), 8192, "clip_text: 8192 cap")
+
+-- ---------------------------------------------------------------------------
+-- capture / capture_or_raise: crash capture with error.stack
+--
+-- Recording needs an enabled SDK: reconfigure with fake env values (the
+-- startup manifest was already sent at require time, so this stays
+-- curl-free) and point the event buffer at a test table.
+
+os.getenv = function(k)
+  if k == "DATAFLOW_ENDPOINT" then return "http://127.0.0.1:1" end
+  if k == "DATAFLOW_API_KEY" then return "test-key" end
+  if k:sub(1, 9) == "DATAFLOW_" then return nil end
+  return real_getenv(k)
+end
+dataflow.configure()
+
+local events = dataflow._test_buffer({})
+
+-- error path, no open span: false + original error, synthetic exception span
+local ok, err = dataflow.capture(function() error("boom", 0) end)
+eq(ok, false, "capture: error -> false")
+eq(err, "boom", "capture: original error object forwarded")
+eq(#events, 1, "capture: synthetic exception span recorded")
+local ev = events[1]
+eq(ev:find('"name":"exception"', 1, true) ~= nil, true, "capture: synthetic span named exception")
+eq(ev:find('"type":"FUNCTION_CALL"', 1, true) ~= nil, true, "capture: synthetic span is FUNCTION_CALL")
+eq(ev:find('"status_code":500', 1, true) ~= nil, true, "capture: status 500")
+eq(ev:find('"error_message":"boom"', 1, true) ~= nil, true, "capture: error_message carries the raw error")
+eq(ev:find('"error.stack":"', 1, true) ~= nil, true, "capture: error.stack metadata present")
+eq(ev:find("stack traceback", 1, true) ~= nil, true, "capture: error.stack carries trace frames")
+
+-- success path: true + all fn results, nothing recorded
+local r1, r2, r3 = dataflow.capture(function(a, b) return a + b, "tag" end, 2, 3)
+eq(r1, true, "capture: success -> true")
+eq(r2, 5, "capture: forwards fn results (first)")
+eq(r3, "tag", "capture: forwards fn results (second)")
+eq(#events, 1, "capture: success records nothing")
+
+-- capture_or_raise: records, then re-raises at the call site
+local cro_ok, cro_err = pcall(dataflow.capture_or_raise, function() error("boom3", 0) end)
+eq(cro_ok, false, "capture_or_raise: error propagates to the caller")
+eq(tostring(cro_err):find("boom3", 1, true) ~= nil, true, "capture_or_raise: original error text survives")
+eq(#events, 2, "capture_or_raise: recorded before raising")
+
+-- disabled SDK: plain xpcall passthrough, nothing recorded
+os.getenv = function(k)
+  if k == "DATAFLOW_DISABLED" then return "true" end
+  if k:sub(1, 9) == "DATAFLOW_" then return nil end
+  return real_getenv(k)
+end
+dataflow.configure()
+local dis_ok, dis_err = dataflow.capture(function() error("boom4", 0) end)
+eq(dis_ok, false, "capture disabled: still false + err")
+eq(dis_err, "boom4", "capture disabled: original error forwarded")
+eq(#events, 2, "capture disabled: nothing recorded")
+
+-- recording on the CURRENT span: the open server span is reused and capture
+-- neither ends nor replaces it
+os.getenv = function(k)
+  if k == "DATAFLOW_ENDPOINT" then return "http://127.0.0.1:1" end
+  if k == "DATAFLOW_API_KEY" then return "test-key" end
+  if k:sub(1, 9) == "DATAFLOW_" then return nil end
+  return real_getenv(k)
+end
+dataflow.configure()
+local srv = dataflow.start_server_span("GET /boom")
+local cur_ok, cur_err = dataflow.capture(function() error("boom5", 0) end)
+eq(cur_ok, false, "capture on current span: false")
+eq(cur_err, "boom5", "capture on current span: original error forwarded")
+eq(#events, 2, "capture on current span: capture does not end the open span")
+srv:end_()
+eq(#events, 3, "capture on current span: event ships when the owner ends the span")
+local ev2 = events[3]
+eq(ev2:find('"name":"GET /boom"', 1, true) ~= nil, true, "capture on current span: keeps the open span's name")
+eq(ev2:find('"type":"HTTP_SERVER"', 1, true) ~= nil, true, "capture on current span: keeps the span type")
+eq(ev2:find('"status_code":500', 1, true) ~= nil, true, "capture on current span: status 500")
+eq(ev2:find('"error_message":"boom5"', 1, true) ~= nil, true, "capture on current span: error_message")
+eq(ev2:find('"error.stack":"', 1, true) ~= nil, true, "capture on current span: error.stack metadata")
+
+os.getenv = real_getenv
 
 print(string.format("dataflow transport tests: %d passed, %d failed", passed, failed))
 if failed > 0 then os.exit(1) end
