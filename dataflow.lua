@@ -10,6 +10,10 @@
 --   dataflow.trace("etl.Transform", function(span)
 --       span:data("rows", 42)
 --   end)
+--   local http = dataflow.http_span("GET", "https://api.example.com/v1/users")
+--   -- attach header "X-Dataflow-Trace-Id: " .. http:trace_id() to the request
+--   http:set_status(200)
+--   http:finish()  -- transport spans must be finished explicitly
 --   dataflow.flush()
 --
 -- Env: DATAFLOW_ENDPOINT (http://host:port), DATAFLOW_API_KEY,
@@ -20,7 +24,7 @@
 -- once); field NAMES also travel in `data.fields` metadata for lineage, so
 -- adding client-side encryption later stays transparent to the dashboard.
 
-local M = { _VERSION = "0.2.0" }
+local M = { _VERSION = "0.3.0" }
 
 -- ---------------------------------------------------------------------------
 -- settings
@@ -399,6 +403,178 @@ end
 
 --- Wraps a pre-encoded JSON payload value.
 function M.raw(json) return { __raw = true, json = json } end
+
+-- ---------------------------------------------------------------------------
+-- transport spans (outgoing HTTP calls + DB queries; no new dependencies)
+
+-- Pure: splits a URL into host (authority, userinfo stripped) and path for
+-- span naming and callee attribution. Scheme-less authorities ("host:port")
+-- and relative paths ("/health") degrade gracefully; missing parts -> "".
+local function parse_url(url)
+  local target = tostring(url or ""):match("^%s*(.-)%s*$")
+  local host, path = "", ""
+  local scheme, tail = target:match("^([a-zA-Z][%w+.-]*)://(.*)$")
+  if scheme then
+    local authority = tail:match("^([^/?#]*)")
+    host = authority:match("^[^@]*@(.*)$") or authority
+    path = tail:match("^[^/?#]*(/[^?#]*)") or ""
+  else
+    local head = target:match("^([^/?#]*)")
+    if head:find("[.:]") then
+      host = head
+      path = target:match("^[^/?#]*(/[^?#]*)") or ""
+    else
+      path = target:match("^(/[^?#]*)") or ""
+    end
+  end
+  if path == "/" then path = "" end
+  return host, path
+end
+
+-- Pure: "GET https://u:p@host:8080/v1/x?q=1" -> "GET host:8080/v1/x".
+function M.http_span_name(method, url)
+  local host, path = parse_url(url)
+  method = string.upper(tostring(method or ""))
+  if host == "" and path == "" then return method end
+  if host == "" then return method .. " " .. path end
+  return method .. " " .. host .. path
+end
+
+local SQL_VERBS = {
+  SELECT = true, INSERT = true, UPDATE = true, DELETE = true,
+  CREATE = true, DROP = true, ALTER = true, TRUNCATE = true,
+  REPLACE = true, MERGE = true, UPSERT = true, CALL = true,
+  EXEC = true, EXECUTE = true, BEGIN = true, COMMIT = true,
+  ROLLBACK = true, GRANT = true, REVOKE = true, VACUUM = true,
+  ANALYZE = true, EXPLAIN = true, SHOW = true, PRAGMA = true,
+}
+
+local SQL_TABLE_KEYWORDS = { FROM = true, INTO = true, UPDATE = true, TABLE = true, JOIN = true }
+
+-- Pure: best-effort comment stripping so summaries don't trip on "-- ..." or
+-- /* ... */ prefixes.
+local function strip_sql_comments(sql)
+  sql = sql:gsub("%-%-.-\n", " ")
+  sql = sql:gsub("%-%-.*$", " ")
+  sql = sql:gsub("/%*.-%*/", " ")
+  return sql
+end
+
+-- Pure: "<VERB> <table>" from SQL — uppercase first keyword; table from the
+-- first FROM|INTO|UPDATE|TABLE|JOIN (skipping IF [NOT] EXISTS and schema
+-- qualifiers, public.items -> items); no known verb -> first word uppercase.
+function M.stmt_summary(sql)
+  sql = strip_sql_comments(tostring(sql or "")):gsub('["`%[%]]', "")
+  local words = {}
+  for w in sql:gmatch("[%w_.]+") do words[#words + 1] = w end
+  if #words == 0 then return "" end
+  local verb = string.upper(words[1])
+  if not SQL_VERBS[verb] then return verb end
+  local table_name = ""
+  for i = 1, #words do
+    if SQL_TABLE_KEYWORDS[string.upper(words[i])] then
+      local j = i + 1
+      if string.upper(words[j] or "") == "IF" then
+        j = j + 1
+        if string.upper(words[j] or "") == "NOT" then j = j + 1 end
+        if string.upper(words[j] or "") == "EXISTS" then j = j + 1 end
+      end
+      local raw = (words[j] or ""):gsub("^%.+", ""):gsub("%.+$", "")
+      table_name = raw:match("%.([%w_]+)$") or raw
+      break
+    end
+  end
+  if table_name == "" then return verb end
+  return verb .. " " .. table_name
+end
+
+-- Pure: single-space the statement and clip to 200 chars for db.statement.
+-- Bind values must never be embedded in the statement passed here.
+function M.clip_statement(sql)
+  local s = tostring(sql or ""):gsub("%s+", " ")
+  s = s:match("^%s*(.-)%s*$") or ""
+  if #s > 200 then s = s:sub(1, 200) end
+  return s
+end
+
+-- Transport span handle: wraps the standard span behind an explicit :finish()
+-- (Lua GC timing is unreliable; __gc is only a last-resort net where the
+-- runtime honors table __gc, e.g. LuaJIT, never a substitute). Finalization
+-- is pcall-wrapped and skipped when tracing is disabled, but the trace id
+-- stays available either way so callers keep propagating context.
+local TransportSpan = {}
+TransportSpan.__index = TransportSpan
+
+local function transport_finish(handle)
+  if handle.ended then return end
+  handle.ended = true
+  local inner = handle.inner
+  if not inner then return end
+  pcall(function() inner:end_() end)
+end
+
+TransportSpan.__gc = transport_finish
+
+function TransportSpan:set_status(code)
+  if self.inner then self.inner:set_status(code) end
+  return self
+end
+
+function TransportSpan:record_error(message)
+  if self.inner then self.inner:record_error(message) end
+  return self
+end
+
+function TransportSpan:trace_id() return self.trace_id end
+
+function TransportSpan:finish()
+  transport_finish(self)
+  return self
+end
+
+local function make_transport_span(kind, name, callee, attrs)
+  local handle = setmetatable({
+    trace_id = new_id(),
+    inner = nil,
+    ended = false,
+  }, TransportSpan)
+  -- Disabled/unconfigured: no recording; the handle stays cheap and the
+  -- generated trace id still propagates to downstream services.
+  if not enabled() then return handle end
+  local inner = make_span(name, kind, current)
+  inner.callee = callee
+  for k, v in pairs(attrs) do inner.attrs[k] = v end
+  handle.trace_id = inner.trace_id
+  handle.inner = inner
+  return handle
+end
+
+--- Outgoing HTTP call span (type HTTP_CLIENT): name "METHOD host/path",
+--- callee_package = host, metadata http.method / http.url. MUST be finished
+--- explicitly: span:finish() records the duration. Record outcomes with
+--- :set_status(http_status) / :record_error(msg), and propagate context by
+--- sending header "X-Dataflow-Trace-Id: <span:trace_id()>".
+function M.http_span(method, url)
+  url = tostring(url or "")
+  return make_transport_span("HTTP_CLIENT", M.http_span_name(method, url),
+    parse_url(url), {
+      ["http.method"] = string.upper(tostring(method or "")),
+      ["http.url"] = url,
+    })
+end
+
+--- Database query span (type DB_QUERY) for any backend: name "<VERB> <table>"
+--- summarized from the SQL, callee_package = system, metadata db.system /
+--- db.statement (single-spaced, clipped to 200 chars). Statements only —
+--- never pass bound values. Finished exactly like http_span().
+function M.db_span(system, statement)
+  statement = tostring(statement or "")
+  return make_transport_span("DB_QUERY", M.stmt_summary(statement),
+    tostring(system or ""), {
+      ["db.system"] = tostring(system or ""),
+      ["db.statement"] = M.clip_statement(statement),
+    })
+end
 
 -- ---------------------------------------------------------------------------
 -- delivery (curl on PATH; fire-and-forget in v0.1)
