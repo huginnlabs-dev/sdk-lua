@@ -2,8 +2,9 @@
 
 Runtime tracing for Lua services (OpenResty, game scripting, ETL glue).
 Completed events batch in memory and ship to the Dataflow REST ingest
-endpoint (`POST /api/v1/ingest`) via `curl` on PATH. No dependencies beyond
-Lua 5.1+/LuaJIT and `curl`.
+endpoint (`POST /api/v1/ingest`) via `curl` on PATH; application logs ship
+the same way (`POST /api/v1/logs`, see [Log capture](#log-capture-060)).
+No dependencies beyond Lua 5.1+/LuaJIT and `curl`.
 
 ## Quick start
 
@@ -31,7 +32,7 @@ worker, so keep call frequency low and let the automatic flush do its job.
 | `DATAFLOW_SAMPLE_RATIO` | 0..1, default `1.0` |
 | `DATAFLOW_BUFFER_SIZE` | buffer ceiling (default `10000`; v0.x flushes at 25 events) |
 | `DATAFLOW_DISABLED` | `"true"` disables recording |
-| `DATAFLOW_HTTP_URL` | HTTP base for the startup manifest |
+| `DATAFLOW_HTTP_URL` | HTTP base for the startup manifest, the route catalog post and log shipping |
 | `DATAFLOW_APP_VERSION` | reported in the startup manifest |
 
 ## Transport spans (0.3.0)
@@ -230,14 +231,60 @@ local ok, session = dataflow.capture_or_raise(verify_session)
 bytes, nil-safe); `clip_statement` reuses it for the 200-char `db.statement`
 clip.
 
+## Log capture (0.6.0)
+
+`dataflow.debug/info/warn/error(message, fields)` — and
+`dataflow.log(level, message, fields)` for a dynamic level — record
+application logs with the current span's `trace_id`/`span_id` (empty when no
+span is open), a millisecond timestamp and stringified `fields` (max 50
+entries, values coerced with `tostring`). Levels normalize to
+`debug|info|warn|error`: case and surrounding whitespace are folded,
+`warning`/`err`/`critical`/`fatal` are accepted aliases, anything unknown
+falls back to `info`.
+
+Entries batch in a bounded buffer (1024 lines; when full the oldest is
+dropped and counted) and ship to `POST /api/v1/logs` — body
+`{"logs":[{"timestamp","level","message","trace_id","span_id","service_name","fields"}]}`,
+at most 1000 entries per batch, header `X-Api-Key`. Delivery is
+fire-and-forget `curl`, byte-for-byte the same invocation as the ingest
+flush: response ignored, never raises, and entries leave the buffer before
+the request so a missing `curl` loses at most one batch.
+
+The endpoint base resolves manifest-style: `DATAFLOW_HTTP_URL`, else a
+URL-form `DATAFLOW_ENDPOINT`. A bare `host:port` endpoint has no derivable
+HTTP base, so logging stays off — as do `DATAFLOW_DISABLED=true` and a
+missing API key; in all of those cases recording is a complete no-op.
+
+```lua
+local dataflow = require("dataflow")
+
+dataflow.trace("job.Sync", function(span)
+  span:data("rows", 42)
+  dataflow.warn("cache miss", { key = "users:1" })   -- correlated with job.Sync
+  dataflow.error("upstream failed", { attempt = 3 })
+  dataflow.flush_logs() -- explicit drain; auto-flush fires at 50 buffered
+end)
+```
+
+Plain Lua has no timer facility this SDK could rely on (OpenResty timers
+live in a separate module), so flushing is **threshold-triggered**: every
+recorded line checks the buffer and, once it holds 50 entries, posts
+synchronously — the same brief worker-blocking caveat as the 25-event span
+flush, so keep call frequency moderate. `dataflow.flush_logs()` forces a
+drain (call it at the end of a request or batch like `dataflow.flush()`),
+and `dataflow.log_stats()` returns `{ buffered = n, dropped = m }` for
+dashboards and tests.
+
 ## Tests
 
 `lua tests/test_dataflow.lua` from the repository root — plain assert-based
 runner over the pure helpers (statement summary, clipping, `clip_text`,
-URL-to-span naming, route extraction, catalog JSON) and the crash-capture
-paths, which run against a test-only buffer hook (`dataflow._test_buffer`)
-after a re-`configure()` with fake `DATAFLOW_*` values — still no server and
-no outbound curl (the startup manifest is sent once at require time).
+URL-to-span naming, route extraction, catalog JSON, `logs_json`) and the
+crash-capture and log-recording paths, which run against test-only buffer
+hooks (`dataflow._test_buffer`, `dataflow._test_log_buffer`, plus a counting
+stub swapped in for `dataflow.flush_logs`) after a re-`configure()` with
+fake `DATAFLOW_*` values — still no server and no outbound curl (the startup
+manifest is sent once at require time).
 
 ## Versioning
 

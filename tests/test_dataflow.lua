@@ -5,12 +5,14 @@
 --   lua tests/test_dataflow.lua
 --
 -- Pure helpers are covered directly (stmt_summary, clip_statement, clip_text,
--- http_span_name, scan_extract, scan_json); the crash-capture paths run via
--- the test-only buffer hook (dataflow._test_buffer) and a re-configure()
--- with fake DATAFLOW_* values — no server, no outbound curl (the startup
--- manifest is sent once at require time and later configure() calls skip
--- it). The delivery and directory-walking paths need a live process and a
--- reachable server, so they stay out of this runner.
+-- http_span_name, scan_extract, scan_json, logs_json); the crash-capture and
+-- log-recording paths run via the test-only buffer hooks
+-- (dataflow._test_buffer, dataflow._test_log_buffer, plus a counting stub
+-- swapped in for dataflow.flush_logs) and a re-configure() with fake
+-- DATAFLOW_* values — no server, no outbound curl (the startup manifest is
+-- sent once at require time and later configure() calls skip it). The
+-- delivery and directory-walking paths need a live process and a reachable
+-- server, so they stay out of this runner.
 
 -- Locate the module relative to this script so `lua tests/test_dataflow.lua`
 -- works from any working directory.
@@ -277,6 +279,124 @@ eq(ev2:find('"type":"HTTP_SERVER"', 1, true) ~= nil, true, "capture on current s
 eq(ev2:find('"status_code":500', 1, true) ~= nil, true, "capture on current span: status 500")
 eq(ev2:find('"error_message":"boom5"', 1, true) ~= nil, true, "capture on current span: error_message")
 eq(ev2:find('"error.stack":"', 1, true) ~= nil, true, "capture on current span: error.stack metadata")
+
+-- ---------------------------------------------------------------------------
+-- log capture: correlation, level normalization, fields, buffer bounds and
+-- the threshold flush. Runs against the enabled fake env configured above;
+-- dataflow._test_log_buffer points the log buffer at a local table and a
+-- counting stub replaces dataflow.flush_logs, so no outbound curl runs.
+
+local logs = dataflow._test_log_buffer({})
+local log_flush_calls = 0
+local real_flush_logs = dataflow.flush_logs
+dataflow.flush_logs = function() log_flush_calls = log_flush_calls + 1 end
+
+-- correlation with the enclosing span + entry JSON shape
+dataflow.trace("job.Logging", function()
+  dataflow.info("hello log", { user = "u1" })
+end)
+eq(#logs, 1, "log: entry recorded in the test buffer")
+local lg = logs[1]
+eq(lg:find('"level":"info"', 1, true) ~= nil, true, "log: level normalized to info")
+eq(lg:find('"message":"hello log"', 1, true) ~= nil, true, "log: message recorded")
+eq(lg:find('"fields":{"user":"u1"}', 1, true) ~= nil, true, "log: fields encoded as an object")
+eq(lg:find('"service_name":"', 1, true) ~= nil, true, "log: service name present")
+eq(lg:find('"timestamp":1', 1, true) ~= nil, true, "log: unix-ms timestamp present")
+local span_event = events[#events]
+local corr_trace = span_event:match('"trace_id":"(%x+)"')
+local corr_span = span_event:match('"span_id":"(%x+)"')
+eq(lg:find('"trace_id":"' .. corr_trace .. '"', 1, true) ~= nil, true, "log: trace id from the current span")
+eq(lg:find('"span_id":"' .. corr_span .. '"', 1, true) ~= nil, true, "log: span id from the current span")
+eq(log_flush_calls, 0, "log: below the threshold nothing is flushed")
+
+-- envelope: pure body builder (mirrors scan_json)
+eq(dataflow.logs_json({}), '{"logs":[]}', "log: logs_json empty -> empty array")
+eq(dataflow.logs_json(nil), '{"logs":[]}', "log: logs_json nil -> empty array")
+local envelope = dataflow.logs_json({ lg })
+eq(envelope:find('{"logs":[', 1, true), 1, "log: logs_json opens the logs array")
+eq(envelope:sub(-2), "]}", "log: logs_json closes the logs array")
+eq(envelope:find('"message":"hello log"', 1, true) ~= nil, true, "log: logs_json carries the entry")
+local many = {}
+for i = 1, 1001 do many[i] = '"e' .. i .. '"' end
+local big = dataflow.logs_json(many)
+eq(big:find('"e1000"', 1, true) ~= nil, true, "log: logs_json keeps 1000 entries")
+eq(big:find('"e1001"', 1, true), nil, "log: logs_json caps the batch at 1000")
+
+-- level normalization: case, aliases, unknown, nil, surrounding whitespace
+dataflow.log("WARN", "w")
+dataflow.log("warning", "w2")
+dataflow.log("ERR", "e")
+dataflow.log("critical", "c")
+dataflow.log("verbose", "v")
+dataflow.log(nil, "n")
+dataflow.log(" debug ", "d")
+eq(logs[2]:find('"level":"warn"', 1, true) ~= nil, true, "log: WARN -> warn")
+eq(logs[3]:find('"level":"warn"', 1, true) ~= nil, true, "log: warning -> warn")
+eq(logs[4]:find('"level":"error"', 1, true) ~= nil, true, "log: ERR -> error")
+eq(logs[5]:find('"level":"error"', 1, true) ~= nil, true, "log: critical -> error")
+eq(logs[6]:find('"level":"info"', 1, true) ~= nil, true, "log: unknown level -> info")
+eq(logs[7]:find('"level":"info"', 1, true) ~= nil, true, "log: nil level -> info")
+eq(logs[8]:find('"level":"debug"', 1, true) ~= nil, true, "log: whitespace trimmed")
+
+-- convenience wrappers cover all four levels
+dataflow.debug("dbg", nil)
+dataflow.info("inf", nil)
+dataflow.warn("wrn", nil)
+dataflow.error("err", nil)
+eq(logs[9]:find('"level":"debug"', 1, true) ~= nil, true, "log: dataflow.debug")
+eq(logs[10]:find('"level":"info"', 1, true) ~= nil, true, "log: dataflow.info")
+eq(logs[11]:find('"level":"warn"', 1, true) ~= nil, true, "log: dataflow.warn")
+eq(logs[12]:find('"level":"error"', 1, true) ~= nil, true, "log: dataflow.error")
+
+-- fields: stringified values, 50-entry cap, non-table -> empty object
+dataflow.info("with fields", { n = 42, b = true, s = "v" })
+local fentry = logs[13]
+eq(fentry:find('"n":"42"', 1, true) ~= nil, true, "log: number field stringified")
+eq(fentry:find('"b":"true"', 1, true) ~= nil, true, "log: boolean field stringified")
+eq(fentry:find('"s":"v"', 1, true) ~= nil, true, "log: string field kept")
+local wide = {}
+for i = 1, 60 do wide[string.format("f%02d", i)] = i end
+dataflow.info("wide", wide)
+local wentry = logs[14]
+eq(wentry:find('"f50":"50"', 1, true) ~= nil, true, "log: 50th field kept")
+eq(wentry:find('"f51"', 1, true), nil, "log: fields capped at 50")
+dataflow.info("no fields", nil)
+eq(logs[15]:find('"fields":{}', 1, true) ~= nil, true, "log: nil fields -> empty object")
+
+-- threshold: the 50th buffered line fires exactly one flush (stubbed)
+for i = 1, 35 do dataflow.info("bulk " .. i, nil) end
+eq(#logs, 50, "log: buffer holds every entry below the cap")
+eq(log_flush_calls, 1, "log: threshold flush fired once at 50")
+eq(dataflow.log_stats().buffered, 50, "log: log_stats counts buffered")
+eq(dataflow.log_stats().dropped, 0, "log: nothing dropped so far")
+
+-- drop-oldest at the 1024 cap (counting stub still swallows the flush)
+local seeded = {}
+for i = 1, 1023 do seeded[i] = '"seed' .. i .. '"' end
+dataflow._test_log_buffer(seeded)
+dataflow.info("overflow a", nil)  -- buffer reaches 1024
+dataflow.error("overflow b", nil) -- oldest line dropped and counted
+eq(#seeded, 1024, "log: buffer stays at the 1024 cap")
+eq(seeded[1], '"seed2"', "log: drop-oldest removed the oldest line")
+eq(seeded[1023]:find('"message":"overflow a"', 1, true) ~= nil, true, "log: order preserved")
+eq(seeded[1024]:find('"message":"overflow b"', 1, true) ~= nil, true, "log: newest line at the tail")
+eq(dataflow.log_stats().buffered, 1024, "log: log_stats sees the full buffer")
+eq(dataflow.log_stats().dropped, 1, "log: drop counter incremented once")
+
+-- disabled SDK: recording and flushing are no-ops (buffer untouched, no curl)
+dataflow.flush_logs = real_flush_logs
+os.getenv = function(k)
+  if k == "DATAFLOW_DISABLED" then return "true" end
+  if k:sub(1, 9) == "DATAFLOW_" then return nil end
+  return real_getenv(k)
+end
+dataflow.configure()
+dataflow.error("not recorded", nil)
+dataflow.log(nil, nil, nil)
+dataflow.flush_logs() -- real flush: disabled -> no-op
+eq(#seeded, 1024, "log disabled: buffer untouched")
+eq(dataflow.log_stats().buffered, 1024, "log disabled: buffered count unchanged")
+eq(dataflow.log_stats().dropped, 1, "log disabled: drop counter unchanged")
 
 os.getenv = real_getenv
 

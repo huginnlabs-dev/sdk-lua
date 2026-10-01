@@ -28,16 +28,24 @@
 -- propagates; capture() hands the error back (false, err), capture_or_raise()
 -- re-raises at the call site.
 --
+-- Log capture: dataflow.log(level, message, fields) and the shorthand
+-- debug/info/warn/error record application logs with the current span's
+-- trace/span ids into a bounded buffer; dataflow.flush_logs() ships them
+-- to POST /api/v1/logs (<= 1000/batch) and the 50th buffered line fires
+-- it automatically (plain Lua has no timers). Best-effort as everywhere
+-- else: never raises, drops on overflow, no-ops when disabled,
+-- unconfigured, or without a derivable HTTP base.
+--
 -- Env: DATAFLOW_ENDPOINT (http://host:port), DATAFLOW_API_KEY,
 -- DATAFLOW_SERVICE_NAME, DATAFLOW_SAMPLE_RATIO, DATAFLOW_BUFFER_SIZE,
--- DATAFLOW_HTTP_URL (HTTP base for the startup manifest and the route
--- catalog post), DATAFLOW_APP_VERSION.
+-- DATAFLOW_HTTP_URL (HTTP base for the startup manifest, the route
+-- catalog post and log shipping), DATAFLOW_APP_VERSION.
 --
 -- Payload VALUES ship as plaintext JSON in v0.1 (a warning is printed
 -- once); field NAMES also travel in `data.fields` metadata for lineage, so
 -- adding client-side encryption later stays transparent to the dashboard.
 
-local M = { _VERSION = "0.5.0" }
+local M = { _VERSION = "0.6.0" }
 
 -- ---------------------------------------------------------------------------
 -- settings
@@ -1056,6 +1064,148 @@ end
 function M._test_buffer(b)
   buffer = type(b) == "table" and b or {}
   return buffer
+end
+
+-- ---------------------------------------------------------------------------
+-- application logs (log shipping with trace correlation)
+--
+-- dataflow.log(level, message, fields) plus debug/info/warn/error record
+-- application logs with the CURRENT span's trace/span ids (empty when none
+-- is open) into a bounded buffer. Plain Lua has no timers this SDK could
+-- rely on, so shipping is threshold-triggered: the 50th buffered line
+-- fires a synchronous, best-effort POST of {"logs":[...]} to /api/v1/logs
+-- via the same fire-and-forget curl invocation as the ingest flush
+-- (response ignored, <= 1000 entries per batch); dataflow.flush_logs()
+-- forces the same post. Never raises, drops on overflow, and no-ops when
+-- the SDK is disabled/unconfigured or when no HTTP base is derivable
+-- (bare host:port endpoint).
+
+local LOG_LEVELS = { debug = true, info = true, warn = true, error = true }
+local LOG_LEVEL_ALIASES = { warning = "warn", err = "error", critical = "error", fatal = "error" }
+local LOG_FIELDS_MAX = 50
+local LOG_BUFFER_MAX = 1024
+local LOG_FLUSH_THRESHOLD = 50
+local LOG_MAX_BATCH = 1000
+
+local log_buffer = {}
+local log_dropped = 0
+
+-- Level -> one of debug|info|warn|error (case/whitespace folded,
+-- warning -> warn, err/critical/fatal -> error, anything unknown -> info).
+local function normalize_log_level(level)
+  local l = string.lower(scan_trim(level))
+  if LOG_LEVELS[l] then return l end
+  if LOG_LEVEL_ALIASES[l] then return LOG_LEVEL_ALIASES[l] end
+  return "info"
+end
+
+-- Fields -> JSON object with every value stringified (tostring), capped at
+-- LOG_FIELDS_MAX entries and sorted for a stable body (like span payloads).
+local function encode_log_fields(fields)
+  if type(fields) ~= "table" then return "{}" end
+  local keys = {}
+  for k in pairs(fields) do
+    if #keys < LOG_FIELDS_MAX then keys[#keys + 1] = k end
+  end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  local parts = {}
+  for i, k in ipairs(keys) do
+    parts[i] = json_escape(tostring(k)) .. ":" .. json_escape(tostring(fields[k]))
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+-- Pure: stable-order JSON body for POST /api/v1/logs (<= LOG_MAX_BATCH
+-- entries, mirroring the server-side cap). Entries are the pre-encoded
+-- objects the buffer holds; anything else degrades to a JSON string.
+function M.logs_json(entries)
+  local ok, body = pcall(function()
+    local parts = {}
+    for i, e in ipairs(type(entries) == "table" and entries or {}) do
+      if i > LOG_MAX_BATCH then break end
+      parts[#parts + 1] = type(e) == "string" and e or json_escape(e)
+    end
+    return '{"logs":[' .. table.concat(parts, ",") .. "]}"
+  end)
+  if not ok then return '{"logs":[]}' end
+  return body
+end
+
+-- Best-effort record: gated on enabled() plus a derivable HTTP base, never
+-- raises (M.log pcall-wraps this), overflow drops the oldest line.
+local function record_log(level, message, fields)
+  if not enabled() or not http_base() then return end
+  local span = current
+  local entry = "{" ..
+      '"timestamp":' .. now_ms() .. "," ..
+      '"level":' .. json_escape(level) .. "," ..
+      '"message":' .. json_escape(message) .. "," ..
+      '"trace_id":' .. json_escape(span and span.trace_id or "") .. "," ..
+      '"span_id":' .. json_escape(span and span.span_id or "") .. "," ..
+      '"service_name":' .. json_escape(service_name()) .. "," ..
+      '"fields":' .. encode_log_fields(fields) .. "}"
+  if #log_buffer >= LOG_BUFFER_MAX then
+    table.remove(log_buffer, 1)
+    log_dropped = log_dropped + 1
+  end
+  log_buffer[#log_buffer + 1] = entry
+  if #log_buffer >= LOG_FLUSH_THRESHOLD then M.flush_logs() end
+end
+
+--- Records an application log; level normalizes to debug|info|warn|error.
+--- Correlated with the current span (trace/span ids, empty when none is
+--- open). Best-effort: never raises.
+function M.log(level, message, fields)
+  pcall(function() record_log(normalize_log_level(level), message, fields) end)
+end
+
+--- Shorthand for M.log with a fixed level.
+function M.debug(message, fields) M.log("debug", message, fields) end
+function M.info(message, fields) M.log("info", message, fields) end
+function M.warn(message, fields) M.log("warn", message, fields) end
+function M.error(message, fields) M.log("error", message, fields) end
+
+-- One fire-and-forget POST of the oldest <= LOG_MAX_BATCH entries; entries
+-- leave the buffer before the request, so a missing curl loses at most the
+-- batch (same trade-off as the ingest flush).
+local function flush_logs_now()
+  local n = #log_buffer
+  if n == 0 or not enabled() then return end
+  local base = http_base()
+  if not base then return end
+  local take = math.min(n, LOG_MAX_BATCH)
+  local batch = {}
+  for i = 1, take do batch[i] = log_buffer[i] end
+  for i = take + 1, n do log_buffer[i - take] = log_buffer[i] end
+  for i = n - take + 1, n do log_buffer[i] = nil end
+  local body = M.logs_json(batch)
+  local cmd = string.format(
+    'curl -s -m 10 -X POST -H "Content-Type: application/json" -H "X-Api-Key: %s" -d %s %s 2>/dev/null',
+    settings.api_key, string.format("%q", body), base .. "/api/v1/logs")
+  local f = io.popen(cmd, "r")
+  if f then f:close() end
+end
+
+--- Ships buffered logs to POST /api/v1/logs (<= 1000 per batch, header
+--- X-Api-Key). Best-effort: response ignored, never raises. Fired
+--- automatically when the buffer reaches LOG_FLUSH_THRESHOLD (50) lines.
+function M.flush_logs()
+  pcall(flush_logs_now)
+end
+
+--- Buffer counts: entries waiting to ship and entries lost to the 1024
+--- cap (drop-oldest). Observability + test seam.
+function M.log_stats()
+  return { buffered = #log_buffer, dropped = log_dropped }
+end
+
+-- Test hook (tests/test_dataflow.lua): points the log buffer at `b` and
+-- resets the drop counter so overflow tests start from a known state. Nil
+-- or a non-table resets to a fresh buffer. Not part of the public surface.
+function M._test_log_buffer(b)
+  log_buffer = type(b) == "table" and b or {}
+  log_dropped = 0
+  return log_buffer
 end
 
 M.configure()

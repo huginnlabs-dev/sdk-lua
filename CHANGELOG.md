@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0 — 2026-09-30
+
+### Added
+- Log capture: `dataflow.log(level, message, fields)` plus `dataflow.debug/info/warn/error(message, fields)` record application logs with the current span's trace/span ids (empty when no span is open), a millisecond timestamp (`os.time()*1000`) and stringified fields (max 50 entries, values coerced with `tostring`); levels normalize to `debug|info|warn|error` (`warning` → `warn`, `err`/`critical`/`fatal` → `error`, case/whitespace folded, unknown → `info`).
+- Bounded log buffer (1024 lines, oldest dropped and counted on overflow) shipping to `POST /api/v1/logs` (`{"logs":[...]}`, ≤ 1000 per batch, `X-Api-Key` header) via `dataflow.flush_logs()` — the same fire-and-forget curl invocation as the ingest flush, response ignored, never raises; auto-flush is threshold-triggered at 50 buffered lines (plain Lua has no timers the SDK could rely on); `dataflow.log_stats()` returns `{buffered, dropped}`; disabled/unconfigured SDK or a bare `host:port` endpoint (no derivable HTTP base) makes recording a complete no-op.
+- Pure `dataflow.logs_json(entries)` body builder (mirrors `scan_json`) and a `dataflow._test_log_buffer(b)` test hook; `tests/test_dataflow.lua` covers span correlation, entry JSON shape, level normalization, field stringification/caps, drop-oldest, the 50-line threshold (via a counting stub swapped in for `flush_logs`) and the disabled no-op (run manually — no Lua toolchain in CI).
+
 ## 0.5.0 — 2026-09-30
 
 ### Added
