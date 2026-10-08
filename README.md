@@ -1,4 +1,11 @@
+<div align="center">
+
+  <img src="assets/mark.svg" width="72" alt="Dataflow mark" />
+
 # dataflow.lua — HuginnLabs Dataflow SDK for Lua
+
+</div>
+
 
 Runtime tracing for Lua services (OpenResty, game scripting, ETL glue).
 Completed events batch in memory and ship to the Dataflow REST ingest
